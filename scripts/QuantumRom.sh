@@ -88,7 +88,7 @@ DOWNLOAD_FIRMWARE() {
 
     local MODEL="$1"
     local CSC="$2"
-    local DOWN_DIR="${3}/$MODEL"
+    local DOWN_DIR="$3"
 	local VERSION="${4:-}"
 
     rm -rf "$DOWN_DIR"
@@ -113,6 +113,7 @@ DOWNLOAD_FIRMWARE() {
     echo -e "  Samsung FW Downloader   "
     echo -e "======================================"
     echo -e "MODEL: $MODEL | CSC: $CSC"
+	echo -e "DOWNLOAD DIR: $DOWN_DIR"
 
     # Check version
 	if [ -z "$VERSION" ]; then
@@ -395,7 +396,7 @@ EXTRACT_FIRMWARE() {
         rm -f "$file"
     done
 
-    echo -e "Firmware Extraction complete."
+    echo -e "Firmware extraction complete."
 }
 
 
@@ -438,21 +439,15 @@ PREPARE_PARTITIONS() {
 
     local EXTRACTED_FIRM_DIR="$1"
 
-    echo -e "Preparing partitions. $STOCK_DEVICE"
+    echo -e "Preparing partitions."
 	
 	if [ ! -d "$EXTRACTED_FIRM_DIR" ]; then
         echo -e "- Directory not found: $EXTRACTED_FIRM_DIR"
         return 1
     fi
 
-    if [ -z "$STOCK_DEVICE" ] || [ "$STOCK_DEVICE" = "None" ]; then
-        local BUILD_PARTITIONS="odm,odm_dlkm,product,system,system_ext,system_dlkm,vendor,vendor_dlkm,odm_a,odm_dlkm_a,product_a,system_a,system_ext_a,system_dlkm_a,vendor_a,vendor_dlkm_a,optics,optics_a"
-	else
-	    local BUILD_PARTITIONS="product,system_ext,system"
-    fi
-
 	# Delete empty b slot images
-    find "$EXTRACTED_FIRM_DIR" -type f -name '*_b.img' -size 0c -exec rm -rf {} +
+	rm -rf "$EXTRACTED_FIRM_DIR"/*_b.img
 
     for img in "$EXTRACTED_FIRM_DIR"/*_a.img; do
         [ -f "$img" ] || continue
@@ -460,31 +455,6 @@ PREPARE_PARTITIONS() {
         new="${img%_a.img}.img"
         mv -f "$img" "$new"
     done
-
-    IFS=',' read -r -a KEEP <<< "$BUILD_PARTITIONS"
-
-    for i in "${!KEEP[@]}"; do
-        KEEP[$i]=$(echo -e "${KEEP[$i]}" | xargs)
-    done
-
-    shopt -s nullglob dotglob
-
-    for item in "$EXTRACTED_FIRM_DIR"/*; do
-        base=$(basename "$item")
-
-        [[ "$base" == *.img ]] && base="${base%.img}"
-
-        keep_this=0
-        for k in "${KEEP[@]}"; do
-            [[ "$k" == "$base" ]] && keep_this=1 && break
-        done
-
-        if [[ $keep_this -eq 0 ]]; then
-            rm -rf -- "$item"
-        fi
-    done
-
-    shopt -u nullglob dotglob
 }
 
 
@@ -576,11 +546,6 @@ EXTRACT_FIRMWARE_IMG() {
             [ -e "$imgfile" ] || continue
             extract_img "$imgfile"
         done
-
-	    if [ "${GITHUB_ACTIONS}" = "true" ]; then
-            rm -f "$EXTRACTED_FIRM_DIR"/*.img
-        fi
-
     else
         local TARGET_IMG="${EXTRACTED_FIRM_DIR}/$MODE"
 
@@ -591,8 +556,6 @@ EXTRACT_FIRMWARE_IMG() {
 
         extract_img "$TARGET_IMG"
     fi
-
-    chmod -R u+rwX "$EXTRACTED_FIRM_DIR"
 }
 
 
@@ -843,6 +806,20 @@ PATCH_FLAG_SECURE() {
     return-object v0
     '
 
+	local REPLACE_BODY_3='
+    .locals 4
+
+    const/4 p2, 0x0
+
+    invoke-virtual {p1}, Landroid/util/ArraySet;->clear()V
+
+    iget-object v0, p0, Lcom/android/server/wm/ScreenRecordingCallbackController;->mLastInvokedStateByUid:Landroid/util/ArrayMap;
+
+    invoke-virtual {v0}, Landroid/util/ArrayMap;->clear()V
+
+    return-void
+    '
+
 	echo -e "Patching flag secure."
 
     local EXTRACTED_FIRM_DIR="$1"
@@ -877,16 +854,22 @@ PATCH_FLAG_SECURE() {
         14)
             FILE_1="${WORK_DIR}/smali_classes3/com/android/server/wm/WindowState.smali"
             METHOD_NAME_1=".method public isSecureLocked()Z"
+
 			FILE_2="${WORK_DIR}/smali_classes3/com/android/server/wm/WindowManagerService.smali"
             METHOD_NAME_2=".method public notifyScreenshotListeners(I)Ljava/util/List;"
             ;;
         15|16|17)
             FILE_1="${WORK_DIR}/smali_classes2/com/android/server/wm/WindowState.smali"
             METHOD_NAME_1=".method public final isSecureLocked()Z"
+
 			FILE_2="${WORK_DIR}/smali_classes2/com/android/server/wm/WindowManagerService.smali"
             METHOD_NAME_2=".method public final notifyScreenshotListeners(I)Ljava/util/List;"
+
 			FILE_3="${WORK_DIR}/smali/com/android/server/devicepolicy/DevicePolicyManagerService.smali"
 			METHOD_NAME_3=".method public final getScreenCaptureDisabled(Landroid/content/ComponentName;IZ)Z"
+
+			FILE_4="${WORK_DIR}/smali_classes2/com/android/server/wm/ScreenRecordingCallbackController.smali"
+			METHOD_NAME_4=".method public final dispatchCallbacks(Landroid/util/ArraySet;Z)V"
             ;;
         *)
             echo "- Unsupported Android version: $ANDROID_VERSION"
@@ -904,6 +887,10 @@ PATCH_FLAG_SECURE() {
 
 	if [[ -v FILE_3 ]]; then
         REPLACE_SMALI_METHOD "$FILE_3" "$METHOD_NAME_3" "$REPLACE_BODY_1"
+    fi
+
+	if [[ -v FILE_4 ]]; then
+        REPLACE_SMALI_METHOD "$FILE_4" "$METHOD_NAME_4" "$REPLACE_BODY_3"
     fi
 }
 
@@ -936,15 +923,19 @@ PATCH_SECURE_FOLDER() {
 	case "$ANDROID_VERSION" in
         12|13|14)
             FILE_1="${WORK_DIR}/smali_classes2/com/android/server/knox/dar/DarManagerService.smali"
+
 			METHOD_NAME_1=".method public isDeviceRootKeyInstalled()Z"
 	        METHOD_NAME_2=".method public isKnoxKeyInstallable()Z"
+
 			REPLACE_SMALI_METHOD "$FILE_1" "$METHOD_NAME_1" "$REPLACE_BODY_1"
             REPLACE_SMALI_METHOD "$FILE_1" "$METHOD_NAME_2" "$REPLACE_BODY_1"
             ;;
         15|16|17)
             FILE_1="${WORK_DIR}/smali/com/android/server/knox/dar/DarManagerService.smali"
+
 			METHOD_NAME_1=".method public final isDeviceRootKeyInstalled()Z"
 	        METHOD_NAME_2=".method public final isKnoxKeyInstallable()Z"
+
 			REPLACE_SMALI_METHOD "$FILE_1" "$METHOD_NAME_1" "$REPLACE_BODY_1"
             REPLACE_SMALI_METHOD "$FILE_1" "$METHOD_NAME_2" "$REPLACE_BODY_1"
             ;;
@@ -981,7 +972,7 @@ PATCH_PRIVATE_SHARE() {
 }
 
 
-DISABLE_SIGNATURE_VERIFICATION() {
+PATCH_APK_SHARED_USER_ID_VERIFICATION() {
     echo " "
 
 	if [ "$#" -ne 1 ]; then
@@ -989,22 +980,34 @@ DISABLE_SIGNATURE_VERIFICATION() {
         return 1
     fi
 
-    echo -e "Disabling signature verification."
-	# https://github.com/ShaDisNX255/NcX_Stock/commit/e9fca1cedf2405c9f84dc2ee4aafa018e59de464
-    # https://forum.xda-developers.com/t/mods-samsung-not-android-mods-collection-exynos.3772017/post-87773529
-    # https://forum.xda-developers.com/t/mods-samsung-not-android-mods-collection-exynos.3772017/post-87773543
+	services="$1"
 
-    local FILE="${1}/smali_classes4/android/util/apk/ApkSignatureVerifier.smali"
-    # patch .method public static blacklist getMinimumSignatureSchemeVersionForTargetSdk(I)I
-    local METHOD_NAME=".method public static blacklist getMinimumSignatureSchemeVersionForTargetSdk(I)I"
-    local REPLACE_BODY='
+    echo -e "Patching apk shared user id verification."
+
+	local ANDROID_VERSION=$(GET_PROP "$EXTRACTED_FIRM_DIR" "system" "ro.system.build.version.release")
+
+	echo "Android version: $ANDROID_VERSION"
+
+	local REPLACE_BODY_1='
     .locals 1
-
+ 
     const/4 v0, 0x1
  
     return v0
-    '
-	REPLACE_SMALI_METHOD "$FILE" "$METHOD_NAME" "$REPLACE_BODY"
+	'
+
+	case "$ANDROID_VERSION" in
+        15)
+            FILE_1="${services}/smali_classes2/com/android/server/pm/PackageManagerServiceUtils.smali"
+            METHOD_NAME_1=".method public static canJoinSharedUserId(Ljava/lang/String;Landroid/content/pm/SigningDetails;Lcom/android/server/pm/SharedUserSetting;I)Z"
+
+			REPLACE_SMALI_METHOD "$FILE_1" "$METHOD_NAME_1" "$REPLACE_BODY_1"
+            ;;
+        *)
+            echo "- Unsupported Android version: $ANDROID_VERSION"
+            return 1
+            ;;
+    esac
 }
 
 
@@ -1017,10 +1020,12 @@ PATCH_KNOX_GUARD() {
     fi
 
     echo -e "Patching knox guard."
+	# patch .method public constructor <init>(Landroid/content/Context;)V
+
     local FILE="${1}/smali_classes2/com/samsung/android/knoxguard/service/KnoxGuardSeService.smali"
-    # patch .method public constructor <init>(Landroid/content/Context;)V
-    local METHOD_NAME_1=".method public constructor <init>(Landroid/content/Context;)V"
-    local REPLACE_BODY_1='
+	local METHOD_NAME_1=".method public constructor <init>(Landroid/content/Context;)V"
+
+	local REPLACE_BODY_1='
     .locals 0
  
 	invoke-direct {p0}, Lcom/samsung/android/knoxguard/IKnoxGuardManager$Stub;-><init>()V
@@ -1038,6 +1043,7 @@ PATCH_KNOX_GUARD() {
 
     throw p0
     '
+
     REPLACE_SMALI_METHOD "$FILE" "$METHOD_NAME_1" "$REPLACE_BODY_1"
 	rm -rf "$FIRM_DIR/$TARGET_DEVICE/system/system/priv-app/KnoxGuard"
 }
@@ -1074,45 +1080,73 @@ PATCH_SSRM() {
 
     local SSRM_DIR="$1"
     local FILE="$SSRM_DIR/smali/com/android/server/ssrm/Feature.smali"
+    local FOUND
 
     echo -e "Patching SSRM."
     echo -e "- Patching: $FILE"
 
-	if [ ! -f "$FILE" ]; then
-	    echo "- File name not found: $FILE"
-		return
-	fi
-
-    if FOUND=$(grep -E 'const-string [vp][0-9]+, "dvfs_policy_.*_xx"' "$FILE"); then
-        echo "- Found DVFS policy: $FOUND"
-
-        if [ -n "$STOCK_DVFS_FILENAME" ]; then
-            sed -i -E \
-            's|(const-string [vp][0-9]+, ")dvfs_policy_[^"]*_[^"]*(")|\1'"$STOCK_DVFS_FILENAME"'\2|' \
-            "$FILE"
-
-            echo "- DVFS policy file name replaced to: ${STOCK_DVFS_FILENAME}"
-        else
-            echo "- STOCK_DVFS_FILENAME is empty. Skipping replacement."
-        fi
-    else
-        echo "- DVFS policy file name not found."
+    if [ ! -f "$FILE" ]; then
+        echo "- File name not found: $FILE"
+        return 1
     fi
 
-    if FOUND=$(grep -E 'const-string [vp][0-9]+, "siop_[^"]*_[^"]*"' "$FILE"); then
-        echo "- Found SIOP policy: $FOUND"
+    if [ -n "$STOCK_DVFS_FILENAME" ]; then
+        if FOUND=$(grep -E 'const-string [vp][0-9]+, "dvfs_policy_[^"]*"' "$FILE" | sed -n '2p'); then
+            if [ -n "$FOUND" ]; then
+                echo "- Found DVFS policy: $FOUND"
 
-        if [ -n "$STOCK_SIOP_POLICY_FILENAME" ]; then
-            sed -i -E \
-            's|(const-string [vp][0-9]+, ")siop_[^"]*_[^"]*(")|\1'"$STOCK_SIOP_POLICY_FILENAME"'\2|' \
-            "$FILE"
+                sed -i -E \
+                    '0,/dvfs_policy_[^"]*/!{
+                        s|(const-string [vp][0-9]+, ")dvfs_policy_[^"]*(")|\1'"$STOCK_DVFS_FILENAME"'\2|
+                    }' \
+                    "$FILE"
 
-            echo "- SIOP policy file name replaced to: ${STOCK_SIOP_POLICY_FILENAME}"
-        else
-            echo "- STOCK_SIOP_POLICY_FILENAME is empty. Skipping replacement."
+                echo "- DVFS policy file name replaced to: ${STOCK_DVFS_FILENAME}"
+            else
+                echo "- DVFS policy file name not found."
+            fi
         fi
     else
-        echo "- SIOP policy file name not found."
+        echo "- Stock DVFS policy file name not found."
+    fi
+
+    if [ -n "$STOCK_SIOP_POLICY_FILENAME" ]; then
+        local SIOP_FULL='siop_[^"_]+_[^"]+'
+        local SSRM_DEF='ssrm_default'
+        local SIOP_DEF='siop_default'
+
+        if FOUND=$(grep -E "const-string [vp][0-9]+, \"${SIOP_FULL}\"" "$FILE"); then
+            echo "- Found SIOP policy: $FOUND"
+
+            sed -i -E \
+                "s#(const-string [vp][0-9]+, \")${SIOP_FULL}(\")#\1${STOCK_SIOP_POLICY_FILENAME}\2#" \
+                "$FILE"
+
+            echo "- SIOP policy file name replaced to: ${STOCK_SIOP_POLICY_FILENAME}"
+
+        elif FOUND=$(grep -E "const-string [vp][0-9]+, \"${SSRM_DEF}\"" "$FILE"); then
+            echo "- Found SSRM default policy: $FOUND"
+
+            sed -i -E \
+                "s#(const-string [vp][0-9]+, \")${SSRM_DEF}(\")#\1${STOCK_SIOP_POLICY_FILENAME}\2#" \
+                "$FILE"
+
+            echo "- SSRM default policy file name replaced to: ${STOCK_SIOP_POLICY_FILENAME}"
+
+        elif FOUND=$(grep -E "const-string [vp][0-9]+, \"${SIOP_DEF}\"" "$FILE"); then
+            echo "- Found SIOP default policy: $FOUND"
+
+            sed -i -E \
+                "s#(const-string [vp][0-9]+, \")${SIOP_DEF}(\")#\1${STOCK_SIOP_POLICY_FILENAME}\2#" \
+                "$FILE"
+
+            echo "- SIOP default policy file name replaced to: ${STOCK_SIOP_POLICY_FILENAME}"
+
+        else
+            echo "- SIOP policy file name not found."
+        fi
+    else
+        echo "- Stock SIOP policy file name not found."
     fi
 }
 
@@ -1276,7 +1310,7 @@ FIX_VNDK() {
 						    cp -a "${VNDK_EXTRACT_DIR}/31/." "$TARGET_ROM_SYSTEM_EXT_DIR/"
 						    cp -a "${VNDK_EXTRACT_DIR}/30/." "$TARGET_ROM_SYSTEM_EXT_DIR/"
 					    	cp -a "${VNDK_EXTRACT_DIR}/dual_vndks/30_31/." "$TARGET_ROM_SYSTEM_EXT_DIR/etc/vintf/"
-					    	echo "- Dual vndk 30 and 31 copied successfully"
+					    	echo "- Dual VNDK 30 and 31 copied successfully"
 				        fi
                     else
                         echo "- ERROR: Extracted VNDK directory not found:"
@@ -1873,7 +1907,7 @@ FIX_CAMERA() {
     local ANDROID_VERSION=$(GET_PROP "$EXTRACTED_FIRM_DIR" "system" "ro.system.build.version.release")
 
     if [ "$STOCK_DEVICE_CHIPSET" = "MediaTek" ] && [ "$BUILD_BRAND" != "MTK" ]; then
-        echo "- Adding mediatek camera related files."
+        echo "- Adding MediaTek camera related files."
 
         if [ ! -f "${QT_DIR}/QuantumROM/Mods/Apps/MTK_Camera_Files_Android_${ANDROID_VERSION}.zip" ]; then
             if curl -fsSL --connect-timeout 5 https://www.google.com >/dev/null; then
@@ -1903,7 +1937,7 @@ FIX_CAMERA() {
             sed -i "$((FIRST_CAM_LINE-1))r ${QT_DIR}/QuantumROM/Mods/Apps/MTK_Camera_Files_Android_${ANDROID_VERSION}/system/etc/floating_feature.xml" "${EXTRACTED_FIRM_DIR}/system/system/etc/floating_feature.xml"
 			rm -rf "${QT_DIR}/QuantumROM/Mods/Apps/MTK_Camera_Files_Android_${ANDROID_VERSION}/system/etc/floating_feature.xml"
 
-            echo "- Copying A34 mediatek camera related files."
+            echo "- Copying A34 MediaTek camera related files."
             cp -rfa "${QT_DIR}/QuantumROM/Mods/Apps/MTK_Camera_Files_Android_${ANDROID_VERSION}/system/." "${EXTRACTED_FIRM_DIR}/system/system"
         fi
     fi
@@ -1975,7 +2009,7 @@ APPLY_STOCK_CONFIG() {
 		export STOCK_SIOP_POLICY_FILENAME="$(grep -m1 '^STOCK_SIOP_POLICY_FILENAME=' "${DEVICES_DIR}/$STOCK_DEVICE/config" | cut -d= -f2 | tr -d '\r')"
     fi
 
-	echo "Stock device vndk version: $STOCK_VNDK_VERSION"
+	echo "Stock device VNDK version: $STOCK_VNDK_VERSION"
     export STOCK_ROM_FLOATING_FEATURE="${DEVICES_DIR}/$STOCK_DEVICE/floating_feature.xml"
 
 	if [ ! -f "$STOCK_ROM_FLOATING_FEATURE" ]; then
@@ -2014,9 +2048,10 @@ APPLY_STOCK_CONFIG() {
     # Apply stock floating feature.
 	APPLY_STOCK_ROM_FLOATING_FEATURE "$STOCK_ROM_FLOATING_FEATURE" "$TARGET_ROM_FLOATING_FEATURE"
 
-    # Fix unsupported BPF error for kernels lower than 5.10.
+    # Fix unsupported BPF error for kernels with BPF lower than 5.10.
     if [ "$USE_UI_8_TETHERING_APEX" = "True" ]; then
-        cp -rfa "${QT_DIR}/QuantumROM/Mods/Tethering_Apex/UI-8/." "${EXTRACTED_FIRM_DIR}/"
+	    rm -rf "${EXTRACTED_FIRM_DIR}"/system/system/apex/com.google.android.tethering*.apex
+        cp -rfa "${QT_DIR}/QuantumROM/Mods/Tethering_Apex/OneUI-8/." "${EXTRACTED_FIRM_DIR}/"
     fi
 
     if [ "$STOCK_DEVICE_TYPE" = "jdm" ]; then
@@ -2160,7 +2195,7 @@ APPLY_JDM_SPECIAL() {
         return 1
     fi
 
-	echo -e "Applying jdm device feature."
+	echo -e "Applying JDM device feature."
 
 	local EXTRACTED_FIRM_DIR="$1"
 	local ANDROID_VERSION=$(GET_PROP "$EXTRACTED_FIRM_DIR" "system" "ro.system.build.version.release")
@@ -2425,10 +2460,10 @@ APPLY_CUSTOM_FEATURES() {
 
 	local EXTRACTED_FIRM_DIR="$1"
 
-	echo -e "Applying usefull features."
+	echo -e "Applying useful features."
 
-    if [ -d "${QT_DIR}/QuantumROM/usefull_things" ]; then
-        cp -a "${QT_DIR}/QuantumROM/usefull_things/." "${QT_DIR}/OUT"
+    if [ -d "${QT_DIR}/QuantumROM/useful_things" ]; then
+        cp -a "${QT_DIR}/QuantumROM/useful_things/." "${QT_DIR}/OUT"
     fi
 
 	if [ ! -d "${EXTRACTED_FIRM_DIR}/system" ]; then
@@ -2453,7 +2488,7 @@ APPLY_CUSTOM_FEATURES() {
 }
 
 
-DECODE_OMC() {
+DECODE_CSC() {
     echo " "
 
     if [ "$#" -ne 2 ]; then
@@ -2461,7 +2496,7 @@ DECODE_OMC() {
         return 1
     fi
 
-    echo -e "-Decoding CSC - odm,optics."
+    echo -e "-Decoding CSC - odm, optics."
 
     if ! command -v java >/dev/null 2>&1; then
         echo -e "- Java is not installed."
